@@ -1,0 +1,126 @@
+#!/bin/sh
+
+#
+# Script Name: 
+#   pfsense_to_influxdb
+#
+# Author:
+#   Eugene Gladchenko
+#
+# Description:
+#   The script reads and parses the output of rate utility (by Mateusz Golicz)
+#   and writes download/upload rates per host in bits per second to the
+#   InfluxDB database.
+#
+# Run information:
+#   This script is supposed to be run at a pfSense host via some script from
+#   /usr/local/etc/rc.d directory. See pfsense_to_influxdb_lan.sh for example.
+#
+# Error logs:
+#   Any errors or output associated with the script can be found in
+#   /var/log/system.log.
+#   You can run "clog /var/log/system.log | grep pfsense_to_influxdb" to find
+#   the log entries.
+#
+# Usage:
+#   pfsense_to_influxdb -u influxdb_url -d database -n cidr -i interface
+#
+# Example:
+#   pfsense_to_influxdb -u http://1.2.3.4:8086 -d office_lan -n 192.168.0.0/16 -i igb0
+#
+# The output of the following is parsed:
+#   rate -i igb0 -r 1 -lenAb -c 192.168.0.0/16 -d
+#   -e Output a separator after every report to improve readability.
+#   Please see https://manned.org/rate.1 for other details.
+#
+#192.168.1.143:283760:36784:157232:19800:57:58:31:31
+#192.168.0.148:98088:91560:63832:76736:38:39:28:30
+#[...]
+#192.168.3.18:6656:5472:432:528:11:11:1:1
+#192.168.3.113:7184:2488:864:960:5:5:2:2
+#192.168.3.231:9328:27192:0:0:13:14:0:0
+#192.168.3.130:5960:7728:5024:6312:2:4:1:2
+#192.168.0.20:23696:132504:2872:17288:13:21:4:7
+#- - - - - - - - - - - - - - - - - - -
+#
+#<host IP>:<overall input bytes #>:<overall output bytes #>:<momentary input bytes #>:<momentary output bytes #>:<overall packet input #>:<overall packet output #>:<momentary packet input #>:<momentary packet output #>
+#192.168.0.20: 23696:132504: 2872:17288: 13:21: 4:7
+#^^^^^^^^^^^^                ^^^^ ^^^^^ these are inserted into InfluxDB every second
+#
+
+set -e
+
+log() {
+  /usr/bin/logger -t pfsense_to_influxdb "$0: $*"
+  echo 1>&2 "$0: $*"
+}
+
+err() {
+  exitval=$1
+  shift
+  log "ERROR: $*"
+  exit $exitval
+}
+
+usage() {
+  echo 'USAGE: pfsense_to_influxdb -u influxdb_url -d database -n cidr -i interface'
+}
+
+url=
+database=
+cidr=
+interface=
+
+while getopts ":u:d:n:i:" _opt; do
+  case "$_opt" in
+    u) url="$OPTARG" ;;
+    d) database="$OPTARG" ;;
+    n) cidr="$OPTARG" ;;
+    i) interface="$OPTARG" ;;
+    :) err 2 "Option '-$OPTARG' requires an argument" ;;
+    ?) err 2 "Unknown option '-$OPTARG'" ;;
+  esac
+done
+
+[ -z "$url" ]       && { usage; err 2 "Option '-u' is missing"; }
+[ -z "$database" ]  && { usage; err 2 "Option '-d' is missing"; }
+[ -z "$cidr" ]      && { usage; err 2 "Option '-n' is missing"; }
+[ -z "$interface" ] && { usage; err 2 "Option '-i' is missing"; }
+shift $(($OPTIND - 1))
+[ $# -ne 0 ]        && { usage; err 2 "Unexpected parameters: $*"; }
+
+pgrep -qf "$0" && { err 3 "$0 is already running"; }
+
+log "Traffic analyzer started at `/bin/date +'%Y%m%d %H:%M:%S'` (interface: $interface, network: $cidr)"
+
+# Everything looks good so far. Let's write some data to the database.
+# Writing data with the InfluxDB API: https://docs.influxdata.com/influxdb/v1.7/guides/writing_data/
+
+# Create the database even if it exists.
+/usr/local/bin/curl -sS -k --fail-early -XPOST "$url/query" --data-urlencode "q=CREATE DATABASE $database" >/dev/null || err 1 "ERROR: failed to access InfluxDB to create the database $database: $url"
+
+# We won't need the original URL any more so we add a useful part to the variable.
+# Data arrive every second so the precision is set to 's'.
+url="$url/write?db=$database&precision=s"
+
+data=""
+
+rate -i $interface -r 1 -lenAb -c $cidr -d | while read -r line; do
+  case $line in
+  -*)
+    /usr/local/bin/curl -sS -k --fail-early -XPOST "$url" --data-binary "$data" || log "ERROR: failed to write data into InfluxDB: $url"
+    data=""
+    ;;
+  *)
+    set -f; IFS=:
+    set -- $line
+    host=$1
+    download=$4
+    upload=$5
+    # We don't make up any timestamps, InfluxDB will do.
+    data=$(printf '%s\n%s\n%s\n' $data \
+      "bandwidth,host=$host,direction=download bits=$download" \
+      "bandwidth,host=$host,direction=upload bits=$upload")
+    ;;
+  esac
+done
